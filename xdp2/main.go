@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
+	"net/http"
 	"os"
 	"os/signal"
 	"syscall"
@@ -14,16 +15,87 @@ import (
 	"github.com/vishvananda/netlink"
 )
 
+var clientNic, serverNic nicInfo
+var xdpEnabled bool
+
 func main() {
-	var clientNic, serverNic nicInfo
-	if err := clientNic.New("enp26s0f0", 1); err != nil {
-		fmt.Printf("Failed to initialize client NIC: %v\n", err)
+	// 初始化 XDP 程序
+	err := initNic("eth0", "eth1")
+	if err != nil {
+		fmt.Printf("Failed to initialize NICs: %v\n", err)
 		return
 	}
-	if err := serverNic.New("enp26s0f1", 1); err != nil {
-		fmt.Printf("Failed to initialize server NIC: %v\n", err)
-		return
+
+	// 启动 HTTP API
+	go startAPI()
+
+	// 监听退出信号
+	termChan := make(chan os.Signal)
+	signal.Notify(termChan, syscall.SIGINT, syscall.SIGTERM)
+	<-termChan
+
+	// 清理 XDP 资源
+	shutdown()
+}
+
+func startAPI() {
+	http.HandleFunc("/toggle_xdp", toggleXDPHandler)
+	http.HandleFunc("/rename_nics", renameNicsHandler)
+	fmt.Println("Starting API server on :8080")
+	err := http.ListenAndServe(":8080", nil)
+	if err != nil {
+		fmt.Printf("Error starting API server: %v\n", err)
 	}
+}
+
+func toggleXDPHandler(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case http.MethodPost:
+		if xdpEnabled {
+			// 停止 XDP 程序
+			shutdown()
+			xdpEnabled = false
+			fmt.Fprintln(w, "XDP program disabled")
+		} else {
+			// 启动 XDP 程序
+			err := initNic("eth0", "eth1")
+			if err != nil {
+				fmt.Fprintf(w, "Failed to enable XDP: %v\n", err)
+				return
+			}
+			xdpEnabled = true
+			fmt.Fprintln(w, "XDP program enabled")
+		}
+	default:
+		http.Error(w, "Invalid method", http.StatusMethodNotAllowed)
+	}
+}
+
+func renameNicsHandler(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case http.MethodPost:
+		err := renameNics("eth2", "eth3")
+		if err != nil {
+			fmt.Fprintf(w, "Failed to rename NICs: %v\n", err)
+			return
+		}
+		fmt.Fprintln(w, "NICs renamed to eth2 and eth3")
+	default:
+		http.Error(w, "Invalid method", http.StatusMethodNotAllowed)
+	}
+}
+
+// 初始化网卡并设置 XDP 程序
+func initNic(clientNicName, serverNicName string) error {
+	// 初始化客户端网卡
+	if err := clientNic.New(clientNicName, 1); err != nil {
+		return fmt.Errorf("failed to initialize client NIC: %v", err)
+	}
+	// 初始化服务器网卡
+	if err := serverNic.New(serverNicName, 1); err != nil {
+		return fmt.Errorf("failed to initialize server NIC: %v", err)
+	}
+
 	client2ServerChan := make(chan []byte, 10000)
 	server2ClientChan := make(chan []byte, 10000)
 
@@ -33,11 +105,28 @@ func main() {
 	serverNic.receive(server2ClientChan)
 	serverNic.send(client2ServerChan)
 
-	termChan := make(chan os.Signal)
-	// 监听退出信号
-	signal.Notify(termChan, syscall.SIGINT, syscall.SIGTERM)
-	<-termChan
+	xdpEnabled = true
+	return nil
+}
 
+// 修改网卡名
+func renameNics(newClientNicName, newServerNicName string) error {
+	// 停止当前网卡的 XDP 程序
+	if xdpEnabled {
+		shutdown()
+	}
+
+	// 重新初始化网卡
+	err := initNic(newClientNicName, newServerNicName)
+	if err != nil {
+		return fmt.Errorf("failed to rename NICs: %v", err)
+	}
+
+	return nil
+}
+
+// 关闭 XDP 程序和套接字
+func shutdown() {
 	clientNic.Program.Close()
 	for i := range clientNic.socketList {
 		clientNic.socketList[i].Close()
@@ -47,7 +136,7 @@ func main() {
 		serverNic.socketList[i].Close()
 	}
 
-	fmt.Println("exit xdp program.")
+	fmt.Println("XDP program shut down.")
 }
 
 type nicInfo struct {
